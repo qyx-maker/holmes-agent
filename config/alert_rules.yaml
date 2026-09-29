@@ -1,0 +1,12 @@
+# Optional per-alert guidance. Alertmanager should route only the alerts that
+# need investigation. Unmatched alerts use the generic Holmes investigation.
+rules: []
+
+# Example for a later runbook-style specialization:
+# rules:
+#   - match:
+#       alertname: KubernetesPodPending
+#       severity: warning
+#     guidance: >-
+#       Prioritize read-only inspection of the named Pod, its scheduling events,
+#       node capacity, taints/tolerations, PVC binding, and image pull state.

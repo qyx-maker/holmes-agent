@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alert-analyzer-config
+  namespace: python
+data:
+  MYSQL_HOST: mysql-0.mysql.mysql.svc.cluster.local
+  MYSQL_PORT: "3306"
+  HOLMES_API_URL: http://holmesgpt-holmes.default.svc.cluster.local
+  ALERT_RULES_FILE: /app/config/alert_rules.yaml
+  WORKER_POLL_SECONDS: "2"
+  TASK_LEASE_SECONDS: "420"
+  DEDUP_WINDOW_SECONDS: "1800"
+  RETRY_DELAYS_SECONDS: 60,180,600
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alert-analyzer-rules
+  namespace: python
+data:
+  alert_rules.yaml: |
+    rules: []
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: python
+  namespace: python
+spec:
+  # Keep one worker replica in the first version; task processing is serialized.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: python
+  template:
+    metadata:
+      labels:
+        app: python
+    spec:
+      containers:
+        - name: alert-analyzer
+          image: hb.reg.com/project/holmes-agent:<tag>
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5000
+          envFrom:
+            - configMapRef:
+                name: alert-analyzer-config
+          env:
+            - name: MYSQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: alert-analyzer-secrets
+                  key: mysql-database
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: alert-analyzer-secrets
+                  key: mysql-user
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: alert-analyzer-secrets
+                  key: mysql-password
+            - name: FEISHU_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: alert-analyzer-secrets
+                  key: feishu-webhook-url
+                  optional: true
+            - name: FEISHU_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: alert-analyzer-secrets
+                  key: feishu-signing-secret
+                  optional: true
+            - name: HOLMES_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: alert-analyzer-secrets
+                  key: holmes-api-key
+                  optional: true
+          volumeMounts:
+            - name: alert-rules
+              mountPath: /app/config/alert_rules.yaml
+              subPath: alert_rules.yaml
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: alert-rules
+          configMap:
+            name: alert-analyzer-rules
+            items:
+              - key: alert_rules.yaml
+                path: alert_rules.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: python
+  namespace: python
+spec:
+  selector:
+    app: python
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
