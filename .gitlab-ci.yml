@@ -10,7 +10,7 @@ build_image:
   rules:
     - if: $CI_COMMIT_TAG
   script:
-    - printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" --username "$HARBOR_USER" --password-stdin Harbor12345
+    - printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" --username "$HARBOR_USER" --password-stdin 
     - docker build -t "$IMAGE_NAME:$CI_COMMIT_TAG" .
     - docker push "$IMAGE_NAME:$CI_COMMIT_TAG"
     - docker rmi "$IMAGE_NAME:$CI_COMMIT_TAG"
