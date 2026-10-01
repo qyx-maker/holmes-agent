@@ -65,7 +65,7 @@ class Settings:
                 "http://holmesgpt-holmes.default.svc.cluster.local",
             ).rstrip("/"),
             holmes_api_key=os.getenv("HOLMES_API_KEY") or None,
-            holmes_timeout_seconds=float(os.getenv("HOLMES_TIMEOUT_SECONDS", "300")),
+            holmes_timeout_seconds=float(os.getenv("HOLMES_TIMEOUT_SECONDS", "900")),
             feishu_webhook_url=os.getenv("FEISHU_WEBHOOK_URL") or None,
             feishu_signing_secret=os.getenv("FEISHU_SIGNING_SECRET") or None,
             alert_rules_file=Path(os.getenv("ALERT_RULES_FILE", "config/alert_rules.yaml")),

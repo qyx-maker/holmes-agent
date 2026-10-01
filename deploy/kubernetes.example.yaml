@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: alert-analyzer-config
-  namespace: python
+  namespace: holmes
 data:
   MYSQL_HOST: mysql-0.mysql.mysql.svc.cluster.local
   MYSQL_PORT: "3306"
@@ -17,7 +17,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: alert-analyzer-rules
-  namespace: python
+  namespace: holmes
 data:
   alert_rules.yaml: |
     rules: []
@@ -25,18 +25,18 @@ data:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: python
-  namespace: python
+  name: holmes
+  namespace: holmes
 spec:
   # Keep one worker replica in the first version; task processing is serialized.
   replicas: 1
   selector:
     matchLabels:
-      app: python
+      app: holmes
   template:
     metadata:
       labels:
-        app: python
+        app: holmes
     spec:
       containers:
         - name: alert-analyzer
@@ -113,11 +113,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: python
-  namespace: python
+  name: holmes
+  namespace: holmes
 spec:
   selector:
-    app: python
+    app: holmes
   ports:
     - name: http
       port: 80
