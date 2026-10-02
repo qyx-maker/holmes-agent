@@ -9,8 +9,8 @@ data:
   HOLMES_API_URL: http://holmesgpt-holmes.default.svc.cluster.local
   ALERT_RULES_FILE: /app/config/alert_rules.yaml
   WORKER_POLL_SECONDS: "2"
-  TASK_LEASE_SECONDS: "420"
-  DEDUP_WINDOW_SECONDS: "1800"
+  TASK_LEASE_SECONDS: "1200"
+  ANALYSIS_MAX_AGE_SECONDS: "1800"
   RETRY_DELAYS_SECONDS: 60,180,600
 ---
 apiVersion: v1
@@ -20,7 +20,18 @@ metadata:
   namespace: holmes
 data:
   alert_rules.yaml: |
-    rules: []
+    rules:
+      - match:
+          alertname: PodCPUUsageHigh
+          severity: warning
+        guidance: >-
+          Investigate only the alerted Pod identified by namespace and pod labels.
+          Confirm the Pod exists and identify its owning workload. Inspect its CPU
+          request/limit, recent CPU usage and throttling around the alert start,
+          recent restarts, and relevant recent Pod logs. Use at most 6 read-only
+          tool calls, then stop. Do not inspect unrelated Pods, ingress, networking,
+          HPA, control-plane, or cluster-wide history. State unavailable evidence
+          explicitly; when evidence is insufficient, give only read-only follow-up.
 ---
 apiVersion: apps/v1
 kind: Deployment

@@ -4,13 +4,12 @@ import asyncio
 import hashlib
 import logging
 from datetime import datetime, timedelta
-from typing import Any
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from alert_analyzer.config import Settings
-from alert_analyzer.database import AlertRecord, CauseState
+from alert_analyzer.database import AlertRecord
 from alert_analyzer.integrations.feishu import send_message
 from alert_analyzer.integrations.holmes import investigate
 from alert_analyzer.queue import utcnow
@@ -18,92 +17,45 @@ from alert_analyzer.schemas import IncomingAlert
 from alert_analyzer.strategies import StrategyRegistry
 
 logger = logging.getLogger(__name__)
-def _normalized(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    return " ".join(value.strip().lower().split())
-
-
-def _cause_key(result: dict[str, Any]) -> str | None:
-    # 原因类别、范围、根因资源三项都必须存在，才允许跨告警合并；
-    # 任一项缺失就不猜测原因是否相同。
-    dimensions = [
-        _normalized(result.get("cause_category")),
-        _normalized(result.get("cause_scope")),
-        _normalized(result.get("root_cause_resource")),
-    ]
-    if not all(dimensions):
-        return None
-    return hashlib.sha256("|".join(dimensions).encode("utf-8")).hexdigest()
-
-
-def _resource_list(result: dict[str, Any], fallback: str) -> list[str]:
-    raw = result.get("affected_resources") or []
-    resources = sorted({str(item).strip() for item in raw if str(item).strip()})
-    return resources or [fallback]
-
-
-def _merge_resources(*values: list[str] | None) -> list[str]:
-    return sorted({item for group in values for item in (group or []) if item})
 
 
 def _build_notification(
     record: AlertRecord,
-    result: dict[str, Any],
-    cause_key: str | None,
-    new_resources: list[str],
-    total_affected: int,
+    analysis: str | None,
     analysis_failed: bool = False,
-) -> dict[str, Any]:
-    """把持久化分析结果渲染成可重试发送的纯数据消息。"""
+) -> dict[str, str]:
+    """把告警身份和 Holmes 原始自然语言结果渲染为可重试消息。"""
     labels = record.payload.get("labels") or {}
     annotations = record.payload.get("annotations") or {}
-    verdict = result.get("verdict", "insufficient_evidence")
+    notification_id = hashlib.sha256(f"{record.event_key}|analysis".encode()).hexdigest()
     if analysis_failed:
         title = f"告警调查失败：{record.alert_name}"
         state_label = "调查失败"
     else:
-        state_label = {
-            "confirmed_incident": "已确认故障",
-            "possible_false_positive": "可能误报",
-            "insufficient_evidence": "证据不足",
-        }.get(verdict, "证据不足")
+        state_label = "Holmes 分析结果"
         title = f"{state_label}：{record.alert_name}"
 
     lines = [
-        f"**结论：** {state_label}",
+        f"**状态：** {state_label}",
         f"**告警：** `{record.alert_name}`",
         f"**指纹：** `{record.fingerprint}`",
         f"**开始时间（UTC）：** {record.starts_at.isoformat()}Z",
         f"**对象：** {record.resource_key}",
     ]
+    lines.append(f"**通知 ID：** `{notification_id}`")
     if labels.get("severity"):
         lines.append(f"**级别：** {labels['severity']}")
     if annotations.get("summary"):
         lines.append(f"**告警摘要：** {annotations['summary']}")
-    if result.get("summary"):
-        lines.extend(["", f"**分析：** {result['summary']}"])
-
-    evidence = result.get("evidence") or []
-    lines.extend(["", "**证据：**"])
-    if evidence:
-        for item in evidence[:8]:
-            availability = "已取得" if item.get("available") else "缺失"
-            lines.append(f"- `{item.get('source', '未知来源')}`（{availability}）：{item.get('detail', '')}")
-        if len(evidence) > 8:
-            lines.append(f"- 另有 {len(evidence) - 8} 项证据未在消息中展开")
-    else:
-        lines.append("- Holmes 未返回可引用的证据")
-
-    recommendations = [] if analysis_failed else result.get("recommended_actions") or []
-    if state_label == "证据不足":
-        recommendations = []
-    lines.extend(["", "**建议：**"])
-    lines.extend([f"- {item}" for item in recommendations[:8]] or ["- 暂无基于证据的修复建议"])
-
-    follow_up = result.get("follow_up") or []
-    if follow_up:
-        lines.extend(["", "**后续取证：**", *[f"- {item}" for item in follow_up[:6]]])
+    if analysis:
+        # 正文保持 Holmes 原文，截断只为遵守飞书卡片的消息长度限制。
+        max_analysis_chars = 12000
+        body = analysis.strip()
+        if len(body) > max_analysis_chars:
+            body = body[:max_analysis_chars].rstrip() + "\n\n（分析内容过长，已截断；完整结果保存在 MySQL。）"
+        lines.extend(["", "**Holmes 分析：**", body])
+    elif analysis_failed:
+        lines.extend(["", "Holmes 在最大重试次数内未返回有效分析文本。"])
     if analysis_failed:
         lines.extend(
             [
@@ -112,19 +64,11 @@ def _build_notification(
                 f"**失败原因：** {record.failure_message or '未知错误'}",
             ]
         )
-    if cause_key:
-        lines.extend(["", f"**原因标识：** `{cause_key[:16]}`"])
-        lines.append(f"**当前累计受影响对象：** {total_affected}")
-        if new_resources:
-            lines.append("**本次新增对象：** " + ", ".join(f"`{item}`" for item in new_resources[:20]))
-            if len(new_resources) > 20:
-                lines.append(f"（另有 {len(new_resources) - 20} 个新增对象）")
-
     return {
         "title": title,
         "markdown": "\n".join(lines),
-        # 本地稳定 ID 用于审计和避免重复排队；飞书机器人不保证按此 ID 去重。
-        "notification_id": hashlib.sha256(f"{record.event_key}|{cause_key or ''}".encode()).hexdigest(),
+        # 同一个事件的发送重试复用 ID；飞书机器人不保证按此 ID 服务端去重。
+        "notification_id": notification_id,
     }
 
 
@@ -160,31 +104,20 @@ def _retry_or_finish(
     if stage == "analysis":
         # Holmes 多次失败属于调查失败，不伪装成误报或已确认根因；
         # 仍创建一次飞书失败通知，且后续只重试发送，不再重跑调查。
-        record.result = {
-            "verdict": "insufficient_evidence",
-            "summary": "Holmes investigation failed before it could return a valid evidence-based result.",
-            "cause_category": None,
-            "cause_scope": None,
-            "root_cause_resource": None,
-            "evidence": [],
-            "recommended_actions": [],
-            "follow_up": [],
-            "affected_resources": [record.resource_key],
-        }
-        record.notification_payload = _build_notification(
-            record,
-            record.result,
-            None,
-            [],
-            1,
-            analysis_failed=True,
-        )
-        record.phase = "notification_pending"
-        record.notification_attempts = 0
-        record.next_attempt_at = now
+        record.result = {"format": "natural_language", "analysis": None}
         record.failure_stage = "Holmes 调查"
         record.updated_at = now
         logger.error("Holmes investigation exhausted retries for alert %s", record.event_key[:12])
+        if settings.feishu_webhook_url:
+            record.notification_payload = _build_notification(record, None, analysis_failed=True)
+            record.notification_id = record.notification_payload["notification_id"]
+            record.phase = "notification_pending"
+            record.notification_attempts = 0
+            record.next_attempt_at = now
+        else:
+            # 飞书未配置时保留最终失败记录，不制造必然失败的通知重试。
+            record.phase = "failed"
+            record.next_attempt_at = None
     else:
         record.phase = "failed"
         record.next_attempt_at = None
@@ -193,6 +126,7 @@ def _retry_or_finish(
 
 def _claim_job(session_factory: sessionmaker[Session], settings: Settings) -> tuple[int, str] | None:
     now = utcnow()
+    stale_before = now - timedelta(seconds=settings.analysis_max_age_seconds)
     due = or_(AlertRecord.next_attempt_at.is_(None), AlertRecord.next_attempt_at <= now)
     ready = and_(AlertRecord.phase.in_(
         ["analysis_pending", "analysis_retry", "notification_pending", "notification_retry"]
@@ -202,6 +136,40 @@ def _claim_job(session_factory: sessionmaker[Session], settings: Settings) -> tu
         AlertRecord.lease_until <= now,
     )
     with session_factory.begin() as session:
+        # Alertmanager/webhook 可能因应用停机而在 MySQL 留下积压任务。
+        # 只过期分析阶段；通知阶段必须继续重试，因为它不应再次调用 Holmes。
+        stale_analysis = session.scalars(
+            select(AlertRecord)
+            .where(
+                AlertRecord.phase.in_(["analysis_pending", "analysis_retry"]),
+                AlertRecord.created_at < stale_before,
+            )
+            .with_for_update()
+        ).all()
+        for stale in stale_analysis:
+            stale.phase = "skipped"
+            stale.next_attempt_at = None
+            stale.lease_until = None
+            stale.updated_at = now
+            logger.info("Skipped stale queued alert %s before Holmes investigation", stale.event_key[:12])
+
+        # 过期租约表示进程在调用期间退出；若对应事件也已过时，不再恢复调查。
+        expired_stale_running = session.scalars(
+            select(AlertRecord)
+            .where(
+                AlertRecord.phase == "analysis_running",
+                AlertRecord.lease_until <= now,
+                AlertRecord.created_at < stale_before,
+            )
+            .with_for_update()
+        ).all()
+        for stale in expired_stale_running:
+            stale.phase = "skipped"
+            stale.next_attempt_at = None
+            stale.lease_until = None
+            stale.updated_at = now
+            logger.info("Skipped stale interrupted alert %s before Holmes retry", stale.event_key[:12])
+
         # 行锁让任务在事务内只被一个 worker 认领。避免依赖 MySQL 8 的
         # SKIP LOCKED，当前集群 MySQL 5.7 也能使用；单副本下按序处理即可。
         record = session.scalar(
@@ -235,9 +203,18 @@ def _process_analysis(
 ) -> None:
     # 先复制必要字段并结束 DB 读取事务，再调用 Holmes；长时间网络等待期间
     # 不持有 MySQL 行锁，Webhook 仍可更新同一告警或写入 resolved 状态。
-    with session_factory() as session:
+    with session_factory.begin() as session:
         record = session.get(AlertRecord, record_id)
         if record is None:
+            return
+        if record.alert_status == "resolved" or record.created_at < utcnow() - timedelta(
+            seconds=settings.analysis_max_age_seconds
+        ):
+            record.phase = "skipped"
+            record.next_attempt_at = None
+            record.lease_until = None
+            record.updated_at = utcnow()
+            logger.info("Skipped resolved or stale alert %s before Holmes investigation", record.event_key[:12])
             return
         incoming = IncomingAlert(
             event_key=record.event_key,
@@ -251,13 +228,29 @@ def _process_analysis(
         )
         guidance = strategies.instructions_for(record.payload)
 
+    # 明确记录调用起点；Holmes 可能耗时数分钟，未完成前仅看完成日志会像是没有触发。
+    logger.info(
+        "Starting Holmes investigation for alert %s (%s)",
+        record_id,
+        incoming.alert_name,
+    )
     try:
         result = investigate(incoming, settings, guidance)
     except Exception as exc:
         with session_factory.begin() as session:
             record = session.scalar(select(AlertRecord).where(AlertRecord.id == record_id).with_for_update())
             if record is not None:
-                _retry_or_finish(record, "analysis", exc, settings, utcnow())
+                now = utcnow()
+                if record.alert_status == "resolved" or record.created_at < now - timedelta(
+                    seconds=settings.analysis_max_age_seconds
+                ):
+                    record.phase = "skipped"
+                    record.next_attempt_at = None
+                    record.lease_until = None
+                    record.updated_at = now
+                    logger.info("Skipped retry for resolved or stale alert %s after Holmes failure", record.event_key[:12])
+                else:
+                    _retry_or_finish(record, "analysis", exc, settings, now)
         return
 
     now = utcnow()
@@ -265,61 +258,25 @@ def _process_analysis(
         record = session.scalar(select(AlertRecord).where(AlertRecord.id == record_id).with_for_update())
         if record is None:
             return
-        record.result = result
+        # Webhook 可能在 Holmes 调查期间收到 resolved；结果可留在库内供审计，
+        # 但结束或已过时的告警不再生成飞书通知，也不更新原因聚合窗口。
+        if record.alert_status == "resolved" or record.created_at < now - timedelta(
+            seconds=settings.analysis_max_age_seconds
+        ):
+            record.result = {"format": "natural_language", "analysis": result}
+            record.phase = "skipped"
+            record.lease_until = None
+            record.next_attempt_at = None
+            record.updated_at = now
+            logger.info("Stored but suppressed stale/resolved Holmes result for alert %s", record.event_key[:12])
+            return
+        record.result = {"format": "natural_language", "analysis": result}
         record.failure_stage = None
         record.failure_message = None
-        cause_key = _cause_key(result)
-        record.cause_key = cause_key
-        resources = _resource_list(result, record.resource_key)
-        new_resources = resources
-        total_affected = len(resources)
-
-        if cause_key:
-            # pending_resources 累积上次通知后新出现的对象；30 分钟内只更新
-            # 这个集合并抑制消息，窗口过后由下一条同原因告警触发汇总通知。
-            state = session.scalar(
-                select(CauseState).where(CauseState.cause_key == cause_key).with_for_update()
-            )
-            if state is None:
-                state = CauseState(
-                    cause_key=cause_key,
-                    last_notified_at=None,
-                    affected_resources=[],
-                    notified_resources=[],
-                    pending_resources=[],
-                    updated_at=now,
-                )
-                session.add(state)
-                session.flush()
-            affected = _merge_resources(state.affected_resources, resources)
-            not_yet_notified = _merge_resources(
-                state.pending_resources,
-                [item for item in affected if item not in (state.notified_resources or [])],
-            )
-            state.affected_resources = affected
-            state.pending_resources = not_yet_notified
-            state.updated_at = now
-            total_affected = len(affected)
-            recent = state.last_notified_at is not None and (now - state.last_notified_at).total_seconds() < settings.dedup_window_seconds
-            if recent:
-                record.phase = "suppressed"
-                record.notification_payload = None
-                record.next_attempt_at = None
-                record.lease_until = None
-                record.updated_at = now
-                logger.info("Suppressed duplicate cause notification for alert %s", record.event_key[:12])
-                return
-            new_resources = not_yet_notified or resources
 
         feishu_enabled = bool(settings.feishu_webhook_url)
         if feishu_enabled:
-            record.notification_payload = _build_notification(
-                record,
-                result,
-                cause_key,
-                new_resources,
-                total_affected,
-            )
+            record.notification_payload = _build_notification(record, result)
             record.notification_id = record.notification_payload["notification_id"]
             record.phase = "notification_pending"
             record.notification_attempts = 0
@@ -335,15 +292,15 @@ def _process_analysis(
 
     if feishu_enabled:
         logger.info(
-            "Holmes analysis completed for alert %s: verdict=%s; Feishu notification queued",
+            "Holmes analysis completed for alert %s (%d characters); Feishu notification queued",
             record_id,
-            result["verdict"],
+            len(result),
         )
     else:
         logger.info(
-            "Holmes analysis completed and saved for alert %s: verdict=%s; Feishu is not configured, notification skipped",
+            "Holmes analysis completed and saved for alert %s (%d characters); Feishu is not configured, notification skipped",
             record_id,
-            result["verdict"],
+            len(result),
         )
 
 
@@ -359,7 +316,6 @@ def _process_notification(
         if record is None or not record.notification_payload:
             return
         notification = record.notification_payload
-        cause_key = record.cause_key
 
     try:
         send_message(settings, notification)
@@ -375,16 +331,6 @@ def _process_notification(
         record = session.scalar(select(AlertRecord).where(AlertRecord.id == record_id).with_for_update())
         if record is None:
             return
-        if cause_key:
-            # 只有飞书确认成功后，才推进原因通知窗口并清空待汇总对象。
-            state = session.scalar(
-                select(CauseState).where(CauseState.cause_key == cause_key).with_for_update()
-            )
-            if state is not None:
-                state.last_notified_at = now
-                state.notified_resources = list(state.affected_resources or [])
-                state.pending_resources = []
-                state.updated_at = now
         record.phase = "complete"
         record.lease_until = None
         record.next_attempt_at = None

@@ -1,9 +1,21 @@
 # Optional per-alert guidance. Alertmanager should route only the alerts that
 # need investigation. Unmatched alerts use the generic Holmes investigation.
-rules: []
+rules:
+  - match:
+      alertname: PodCPUUsageHigh
+      severity: warning
+    guidance: >-
+      Investigate only the alerted Pod identified by namespace and pod labels.
+      First confirm whether that exact Pod still exists and identify its owning
+      workload. Inspect its CPU request/limit, recent CPU usage and throttling
+      evidence around the alert start time, recent restarts, and only the Pod's
+      relevant recent logs. Use at most 6 read-only tool calls, then stop and
+      summarize what the evidence supports. Do not inspect unrelated Pods,
+      ingress, networking, HPA, control-plane, or cluster-wide history. Do not
+      modify cluster state. If metrics or logs are unavailable, state that they
+      are missing and give only the next read-only evidence to collect.
 
 # Example for a later runbook-style specialization:
-# rules:
 #   - match:
 #       alertname: KubernetesPodPending
 #       severity: warning

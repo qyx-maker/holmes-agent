@@ -32,6 +32,7 @@ class AlertRecord(Base):
     lease_until: Mapped[object | None] = mapped_column(DateTime, nullable=True)
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     notification_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # 旧版本 cause_key 字段为兼容现有 MySQL 表保留；自然语言版本不写入或读取它。
     cause_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     notification_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     failure_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -41,7 +42,7 @@ class AlertRecord(Base):
 
 
 class CauseState(Base):
-    """按规范化原因聚合资源，支持 30 分钟窗口内抑制重复通知。"""
+    """保留旧版原因聚合表映射；自然语言版本不再使用或更新此表。"""
 
     __tablename__ = "cause_notification_state"
 

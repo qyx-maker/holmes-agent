@@ -41,6 +41,12 @@ def enqueue_alerts(session_factory: sessionmaker[Session], alerts: list[Incoming
                 for record in active:
                     record.alert_status = "resolved"
                     record.ends_at = alert.ends_at
+                    # 未开始的调查在告警结束后已没有分析价值，立即关闭队列项。
+                    # 正在运行的 Holmes 请求无法安全中断，完成时由 worker 再检查状态。
+                    if record.phase in {"analysis_pending", "analysis_retry"}:
+                        record.phase = "skipped"
+                        record.next_attempt_at = None
+                        record.lease_until = None
                     record.updated_at = now
                     resolved += 1
                 continue
